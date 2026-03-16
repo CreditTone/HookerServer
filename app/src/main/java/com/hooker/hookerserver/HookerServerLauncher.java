@@ -7,9 +7,12 @@ import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
+import java.io.InputStream;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,27 +47,66 @@ public class HookerServerLauncher implements IXposedHookLoadPackage {
                     protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                         Context context = (Context) param.args[0];
                         String packageName = context.getPackageName();
-                        //扫描/data/local/tmp/hooker_server_conf是否存在配置文件，如果不存在则返回
-                        File confDir = new File("/data/local/tmp/hooker_server_conf");
-                        if (!confDir.exists() || !confDir.isDirectory()) {
-                            XposedBridge.log("Not found hooker_server_conf dir");
-                            return;
+
+                        File radarDexFile = new File("/data/local/tmp/radar.dex");
+                        if (!radarDexFile.exists()) {
+                            //把apk的assets目录下的radar.dex拷贝到/data/local/tmp/radar.dex
+                            try {
+                                Context moduleContext = context.createPackageContext(
+                                        "com.hooker.hookerserver",
+                                        Context.CONTEXT_IGNORE_SECURITY
+                                );
+                                InputStream is = moduleContext.getAssets().open("radar.dex");
+                                FileOutputStream fos = new FileOutputStream("/data/user/0/"+packageName+"/radar.dex");
+                                byte[] buffer = new byte[8192];
+                                int len;
+                                while ((len = is.read(buffer)) != -1) {
+                                    fos.write(buffer, 0, len);
+                                }
+                                fos.flush();
+                                fos.close();
+                                is.close();
+                            } catch (Exception e) {
+                                XposedBridge.log(e);
+                            }
                         }
-                        File confFile = new File(confDir, packageName + ".conf");
-                        if (!confFile.exists()) {
-                            XposedBridge.log("Not found " + packageName + ".conf");
-                            return;
+
+                        HookerServerConf config = getHookerServerConf(packageName);
+                        if (config != null) {
+                            Log.i("hooker_server", config.toString());
+                            if (started) return;
+                            started = true;
+                            delayLoadPatch(context, config.controller_dex, config.controller_class);
+                        }else{
+                            File dexPatchFile = new File("/data/user/0/"+packageName+"/hooker_server.dex");
+                            if (!dexPatchFile.exists()) {
+                                return;
+                            }
+                            List<String> allClass = parseHookerServerDexClasses(dexPatchFile.getAbsolutePath());
+                            if (started) return;
+                            started = true;
+                            delayLoadPatch(context, dexPatchFile.getAbsolutePath(), allClass);
                         }
-                        XposedBridge.log("Found config: " + confFile.getAbsolutePath());
-                        // 读取配置文件
-                        HookerServerConf config = loadConfig(confFile);
-                        Log.i("hooker_server", config.toString());
-                        if (started) return;
-                        started = true;
-                        delayLoadPatch(context, config.controller_dex, config.controller_class);
                     }
                 }
         );
+    }
+
+    public HookerServerConf getHookerServerConf(String packageName) throws Exception {
+        //扫描/data/local/tmp/hooker_server_conf是否存在配置文件，如果不存在则返回
+        File confDir = new File("/data/local/tmp/hooker_server_conf");
+        if (!confDir.exists() || !confDir.isDirectory()) {
+            XposedBridge.log("Not found hooker_server_conf dir");
+            return null;
+        }
+        File confFile = new File(confDir, packageName + ".conf");
+        if (!confFile.exists()) {
+            Log.i("hooker_server", "Not found " + packageName + ".conf");
+            return null;
+        }
+        Log.i("hooker_server", "Found config: " + confFile.getAbsolutePath());
+        // 读取配置文件
+        return loadConfig(confFile);
     }
 
     private void delayLoadPatch(Context context, String dexPath, List<String> clazzList) {
@@ -73,11 +115,11 @@ public class HookerServerLauncher implements IXposedHookLoadPackage {
                 new java.util.TimerTask() {
                     @Override
                     public void run() {
-                        XposedBridge.log("HookerServer: start loadPatch after 10s");
+                        Log.i("hooker_server","HookerServer: start loadPatch after 10s");
                         loadPatch(context, dexPath, clazzList);
                     }
                 },
-                10000 // 10秒
+                8000 // 8秒
         );
     }
 
@@ -135,10 +177,15 @@ public class HookerServerLauncher implements IXposedHookLoadPackage {
             } else {
                 cacheDir = context.getCacheDir();
             }
+            File radarDexFile = new File("/data/local/tmp/radar.dex");
+            if (!radarDexFile.exists()) {
+                radarDexFile = new File("/data/user/0/"+context.getPackageName()+"/radar.dex");
+            }
             ClassLoader parent = context.getClassLoader();
             String fullDexPath = dexPath == null ?
-                    "/data/local/tmp/radar.dex" :
-                    "/data/local/tmp/radar.dex:" + dexPath;
+                    radarDexFile.getAbsolutePath() :
+                    radarDexFile.getAbsolutePath() + ":" + dexPath;
+            Log.i("hooker_server", "fullDexPath: " + fullDexPath);
             DexClassLoader loader = new DexClassLoader(
                     fullDexPath,
                     cacheDir.getAbsolutePath(),
@@ -162,5 +209,20 @@ public class HookerServerLauncher implements IXposedHookLoadPackage {
         } catch (Throwable e) {
             XposedBridge.log(e);
         }
+    }
+
+    public static List<String> parseHookerServerDexClasses(String dexPath) {
+        List<String> classList = new ArrayList<>();
+        try {
+            DexFile dexFile = new DexFile(dexPath);
+            Enumeration<String> entries = dexFile.entries();
+            while (entries.hasMoreElements()) {
+                String className = entries.nextElement();
+                classList.add(className);
+            }
+        } catch (Exception e) {
+            XposedBridge.log(e);
+        }
+        return classList;
     }
 }
